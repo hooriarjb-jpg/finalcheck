@@ -1,176 +1,156 @@
 import streamlit as st
-import json, re, os
-from pathlib import Path
+import re, json
 from io import BytesIO
+from difflib import SequenceMatcher
 
-st.set_page_config(page_title="FinalCheck", page_icon="✓", layout="wide")
+st.set_page_config(page_title="FinalCheck V2", page_icon="✓", layout="wide")
 
 st.markdown("""
 <style>
-.block-container {max-width: 1100px; padding-top: 2rem;}
-.fc-card {border:1px solid #ddd; border-radius:14px; padding:18px; margin:8px 0;}
-.small {color:#666; font-size:.9rem;}
+.block-container {max-width: 1120px; padding-top: 2rem;}
+.pass {padding:14px;border-radius:10px;background:#eaf7ee;margin:8px 0}
+.conflict {padding:14px;border-radius:10px;background:#fdecec;margin:8px 0}
+.review {padding:14px;border-radius:10px;background:#fff6df;margin:8px 0}
 </style>
 """, unsafe_allow_html=True)
 
 st.title("FinalCheck")
-st.caption("Compare an approved source against a final draft before it goes out.")
-
-with st.sidebar:
-    st.header("What V1 checks")
-    st.write("Dates & times")
-    st.write("Money & prices")
-    st.write("URLs & emails")
-    st.write("Numbers")
-    st.write("Names / capitalized phrases")
-    st.write("Required phrases")
-    st.divider()
-    st.caption("V1 is deterministic: it does not invent corrections. AI semantic checking is the next layer.")
+st.caption("Pre-flight fact checking for communications documents — V2")
 
 def extract_text(uploaded):
-    if uploaded is None:
-        return ""
-    name = uploaded.name.lower()
+    if uploaded is None: return ""
     data = uploaded.getvalue()
-    if name.endswith(".txt") or name.endswith(".md"):
+    name = uploaded.name.lower()
+    if name.endswith((".txt",".md")):
         return data.decode("utf-8", errors="ignore")
     if name.endswith(".docx"):
         from docx import Document
-        doc = Document(BytesIO(data))
-        return "\n".join(p.text for p in doc.paragraphs)
+        return "\n".join(p.text for p in Document(BytesIO(data)).paragraphs)
     if name.endswith(".pdf"):
         from pypdf import PdfReader
-        reader = PdfReader(BytesIO(data))
-        return "\n".join((p.extract_text() or "") for p in reader.pages)
+        return "\n".join((p.extract_text() or "") for p in PdfReader(BytesIO(data)).pages)
     return ""
 
 MONTHS = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
-patterns = {
-    "Dates": rf"\b{MONTHS}\s+\d{{1,2}}(?:,\s*\d{{4}})?\b|\b\d{{4}}[-/]\d{{1,2}}[-/]\d{{1,2}}\b",
-    "Times": r"\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)\b",
-    "Money": r"(?:CAD\s*)?\$\s?\d[\d,]*(?:\.\d{1,2})?",
-    "URLs": r"https?://[^\s<>\]\)]+|www\.[^\s<>\]\)]+",
-    "Emails": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
-    "Numbers": r"\b\d+(?:,\d{3})*(?:\.\d+)?\b",
-}
 
-def clean(v):
-    return re.sub(r"\s+", " ", v.strip().rstrip(".,;:"))
+def unique(xs):
+    seen=[]; keys=set()
+    for x in xs:
+        x=re.sub(r"\s+"," ",x.strip().rstrip(".,;:"))
+        k=x.lower()
+        if x and k not in keys:
+            keys.add(k); seen.append(x)
+    return seen
 
 def extract(text):
-    out = {}
-    for key, pat in patterns.items():
-        vals = [clean(x if isinstance(x, str) else x[0]) for x in re.findall(pat, text, flags=re.I)]
-        out[key] = list(dict.fromkeys(vals))
-    # Useful proper-name/phrase heuristic: 2–5 consecutive capitalized words.
-    names = re.findall(r"\b(?:[A-Z][A-Za-zÀ-ÿ'’.-]+(?:\s+|$)){2,5}", text)
-    out["Names / phrases"] = list(dict.fromkeys(clean(x) for x in names if len(clean(x)) > 5))
-    return out
+    return {
+      "Date": unique(re.findall(rf"\b{MONTHS}\s+\d{{1,2}}(?:,\s*\d{{4}})?\b|\b\d{{4}}[-/]\d{{1,2}}[-/]\d{{1,2}}\b", text, re.I)),
+      "Time": unique(re.findall(r"\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)\b", text, re.I)),
+      "Price": unique(re.findall(r"(?:CAD\s*)?\$\s?\d[\d,]*(?:\.\d{1,2})?", text, re.I)),
+      "URL": unique(re.findall(r"https?://[^\s<>\]\)]+|www\.[^\s<>\]\)]+", text, re.I)),
+      "Email": unique(re.findall(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", text)),
+    }
 
-def norm(s):
-    return re.sub(r"[^a-z0-9]+", "", s.lower())
+def canon(category, value):
+    s=value.lower().strip()
+    s=s.replace("a.m.","am").replace("p.m.","pm").replace("a.m","am").replace("p.m","pm")
+    s=re.sub(r"\s+"," ",s)
+    if category=="Time":
+        m=re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)",s)
+        if m:
+            h=int(m.group(1)); minute=int(m.group(2) or 0); ap=m.group(3)
+            if ap=="pm" and h!=12: h+=12
+            if ap=="am" and h==12: h=0
+            return f"{h:02}:{minute:02}"
+    if category=="Price":
+        return re.sub(r"[^\d.]","",s)
+    if category in ("URL","Email"):
+        return s.rstrip("/")
+    return re.sub(r"[^a-z0-9]","",s)
 
-def compare(source, draft):
-    s, d = extract(source), extract(draft)
-    rows = []
-    for category in ["Dates","Times","Money","URLs","Emails","Numbers","Names / phrases"]:
-        sn = {norm(x): x for x in s[category]}
-        dn = {norm(x): x for x in d[category]}
-        for k, original in sn.items():
-            if k and k not in dn:
-                # Skip numbers that are substrings of dates/times/money to reduce noise
-                if category == "Numbers":
-                    if any(norm(original) in norm(x) for c in ["Dates","Times","Money"] for x in s[c]):
-                        continue
-                rows.append({
-                    "status":"Needs review",
-                    "category":category,
-                    "source":original,
-                    "draft":"Not found exactly",
-                    "reason":f"Source value is not present exactly in the final draft."
-                })
-    return rows, s, d
-
-tab1, tab2 = st.tabs(["New Check", "How it works"])
-
-with tab1:
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("1. Approved source")
-        src_file = st.file_uploader("Upload source", type=["pdf","docx","txt","md"], key="src")
-        src_text_manual = st.text_area("Or paste approved source text", height=180, key="src_text")
-    with c2:
-        st.subheader("2. Final draft")
-        draft_file = st.file_uploader("Upload draft", type=["pdf","docx","txt","md"], key="draft")
-        draft_text_manual = st.text_area("Or paste final draft text", height=180, key="draft_text")
-
-    st.subheader("3. Required phrases (optional)")
-    required = st.text_area(
-        "One required phrase per line — e.g. sponsor acknowledgement, disclaimer, approved credit line",
-        placeholder="Presented by ABC Corp\nAdmission is free",
-        height=100
-    )
-
-    if st.button("Run FinalCheck", type="primary", use_container_width=True):
-        source = src_text_manual.strip() or extract_text(src_file)
-        draft = draft_text_manual.strip() or extract_text(draft_file)
-        if not source or not draft:
-            st.error("Please provide both an approved source and a final draft.")
+def pair_values(src, drf, category):
+    results=[]
+    unused=list(drf)
+    # exact/canonical passes
+    for s in src:
+        match=next((d for d in unused if canon(category,d)==canon(category,s)),None)
+        if match:
+            results.append(("PASS",category,s,match,"Matches approved source."))
+            unused.remove(match)
         else:
-            issues, sdata, ddata = compare(source, draft)
-            for phrase in [x.strip() for x in required.splitlines() if x.strip()]:
-                if norm(phrase) not in norm(draft):
-                    issues.append({
-                        "status":"Missing",
-                        "category":"Required phrase",
-                        "source":phrase,
-                        "draft":"Not found",
-                        "reason":"Required phrase is missing from the final draft."
-                    })
-
-            score = max(0, 100 - min(100, len(issues)*8))
-            a,b,c = st.columns(3)
-            a.metric("Pre-flight score", f"{score}%")
-            b.metric("Issues to review", len(issues))
-            c.metric("Checks", sum(len(v) for v in sdata.values()))
-
-            if not issues:
-                st.success("No exact-value inconsistencies were detected by the V1 checker.")
+            results.append(("UNMATCHED",category,s,None,""))
+    # turn unmatched source into conflicts only when a same-category candidate exists
+    final=[]
+    for status,cat,s,d,msg in results:
+        if status=="PASS":
+            final.append((status,cat,s,d,msg)); continue
+        if unused:
+            # nearest candidate, useful for date/time/price changes
+            candidate=max(unused, key=lambda x: SequenceMatcher(None, canon(cat,s), canon(cat,x)).ratio())
+            if cat in ("Date","Time","Price"):
+                final.append(("CONFLICT",cat,s,candidate,"Approved and draft values conflict."))
+                unused.remove(candidate)
             else:
-                st.warning("Review these items before publishing.")
-                for i, issue in enumerate(issues, 1):
-                    with st.expander(f"{i}. {issue['category']}: {issue['source']}"):
-                        st.write(f"**Source:** {issue['source']}")
-                        st.write(f"**Draft:** {issue['draft']}")
-                        st.write(issue["reason"])
+                final.append(("REVIEW",cat,s,None,"Present in source but omitted or changed in draft."))
+        else:
+            final.append(("REVIEW",cat,s,None,"Present in source but not found in draft."))
+    return final
 
-            report = {
-                "product":"FinalCheck V1",
-                "score":score,
-                "issues":issues,
-                "source_entities":sdata,
-                "draft_entities":ddata,
-            }
-            st.download_button(
-                "Download QA report",
-                json.dumps(report, indent=2, ensure_ascii=False),
-                file_name="finalcheck_report.json",
-                mime="application/json",
-                use_container_width=True
-            )
+def compare(source,draft,required):
+    S,D=extract(source),extract(draft)
+    rows=[]
+    for cat in ["Date","Time","Price","URL","Email"]:
+        rows += pair_values(S[cat],D[cat],cat)
+    for phrase in required:
+        if phrase.lower() in draft.lower():
+            rows.append(("PASS","Required wording",phrase,phrase,"Required wording is present."))
+        else:
+            rows.append(("CONFLICT","Required wording",phrase,"Missing","Required wording is missing."))
+    return rows
 
-with tab2:
-    st.markdown("""
-### The product loop
-1. Upload the approved source.
-2. Upload the final version.
-3. FinalCheck extracts high-risk facts.
-4. It flags source facts that disappeared or changed.
-5. A human reviews only the flagged items.
+c1,c2=st.columns(2)
+with c1:
+    st.subheader("1. Approved source")
+    sf=st.file_uploader("Upload approved source",type=["pdf","docx","txt","md"])
+    sp=st.text_area("Or paste approved source",height=180)
+with c2:
+    st.subheader("2. Final draft")
+    df=st.file_uploader("Upload final draft",type=["pdf","docx","txt","md"])
+    dp=st.text_area("Or paste final draft",height=180)
 
-### Why this V1 is intentionally small
-The first version proves the core value without email access, CRM integrations, accounts, billing, or a database. It is designed for testing with real communications documents before investing in a full SaaS.
+st.subheader("3. Required wording (optional)")
+req=st.text_area("Only add wording that must appear in the final version — one item per line",height=90)
 
-### Next product layer
-After validation, add an LLM-based semantic comparison with source citations, image/PDF visual checks, team accounts, saved projects, and Stripe billing.
-""")
+if st.button("Run FinalCheck",type="primary",use_container_width=True):
+    source=sp.strip() or extract_text(sf)
+    draft=dp.strip() or extract_text(df)
+    if not source or not draft:
+        st.error("Please provide both documents.")
+    else:
+        rows=compare(source,draft,[x.strip() for x in req.splitlines() if x.strip()])
+        conflicts=[r for r in rows if r[0]=="CONFLICT"]
+        reviews=[r for r in rows if r[0]=="REVIEW"]
+        passes=[r for r in rows if r[0]=="PASS"]
+
+        a,b,c=st.columns(3)
+        a.metric("Conflicts",len(conflicts))
+        b.metric("Needs review",len(reviews))
+        c.metric("Passed",len(passes))
+
+        if conflicts: st.error("Conflicting information found.")
+        elif reviews: st.warning("No direct conflicts found, but some source information needs review.")
+        else: st.success("No factual conflicts detected.")
+
+        for status,cat,s,d,msg in conflicts+reviews+passes:
+            icon={"CONFLICT":"🔴","REVIEW":"🟡","PASS":"🟢"}[status]
+            with st.expander(f"{icon} {status} · {cat} · {s}", expanded=status=="CONFLICT"):
+                st.write(f"**Approved source:** {s}")
+                st.write(f"**Final draft:** {d or 'Not found'}")
+                st.write(msg)
+
+        report=[{"status":x[0],"category":x[1],"approved":x[2],"draft":x[3],"reason":x[4]} for x in rows]
+        st.download_button("Download QA report",json.dumps(report,indent=2,ensure_ascii=False),
+                           "finalcheck_v2_report.json","application/json",use_container_width=True)
+
+st.divider()
+st.caption("V2 separates direct conflicts from omissions/review items and recognizes equivalent time formatting.")
