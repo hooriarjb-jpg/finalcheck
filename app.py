@@ -70,31 +70,32 @@ def canon(category, value):
 
 def pair_values(src, drf, category):
     results=[]
-    unused=list(drf)
-    # exact/canonical passes
+    remaining=list(drf)
+
+    # First remove equivalent values as PASS.
+    unmatched=[]
     for s in src:
-        match=next((d for d in unused if canon(category,d)==canon(category,s)),None)
-        if match:
-            results.append(("PASS",category,s,match,"Matches approved source."))
-            unused.remove(match)
+        exact=next((d for d in remaining if canon(category,d)==canon(category,s)), None)
+        if exact is not None:
+            results.append(("PASS",category,s,exact,"Matches approved source."))
+            remaining.remove(exact)
         else:
-            results.append(("UNMATCHED",category,s,None,""))
-    # turn unmatched source into conflicts only when a same-category candidate exists
-    final=[]
-    for status,cat,s,d,msg in results:
-        if status=="PASS":
-            final.append((status,cat,s,d,msg)); continue
-        if unused:
-            # nearest candidate, useful for date/time/price changes
-            candidate=max(unused, key=lambda x: SequenceMatcher(None, canon(cat,s), canon(cat,x)).ratio())
-            if cat in ("Date","Time","Price"):
-                final.append(("CONFLICT",cat,s,candidate,"Approved and draft values conflict."))
-                unused.remove(candidate)
-            else:
-                final.append(("REVIEW",cat,s,None,"Present in source but omitted or changed in draft."))
+            unmatched.append(s)
+
+    # If source and draft both have a value of a high-risk category, a changed
+    # value is a conflict rather than a generic omission.
+    for s in unmatched:
+        if remaining and category in ("Date","Time","Price"):
+            candidate=remaining.pop(0)
+            results.append(("CONFLICT",category,s,candidate,"Approved and final values conflict."))
         else:
-            final.append(("REVIEW",cat,s,None,"Present in source but not found in draft."))
-    return final
+            results.append(("REVIEW",category,s,None,"Present in approved source but not found in final draft."))
+
+    # Extra high-risk values appearing only in the draft deserve review.
+    for d in remaining:
+        if category in ("Date","Time","Price"):
+            results.append(("REVIEW",category,"Not in approved source",d,"Final draft contains an additional value."))
+    return results
 
 def compare(source,draft,required):
     S,D=extract(source),extract(draft)
@@ -127,7 +128,23 @@ if st.button("Run FinalCheck",type="primary",use_container_width=True):
     if not source or not draft:
         st.error("Please provide both documents.")
     else:
-        rows=compare(source,draft,[x.strip() for x in req.splitlines() if x.strip()])
+        required_items=[x.strip() for x in req.splitlines() if x.strip()]
+        source_entities=extract(source)
+        draft_entities=extract(draft)
+        rows=compare(source,draft,required_items)
+
+        with st.expander("Extraction check — what FinalCheck read from each document"):
+            left,right=st.columns(2)
+            with left:
+                st.markdown("**Approved source**")
+                for cat, vals in source_entities.items():
+                    st.write(f"{cat}: " + (", ".join(vals) if vals else "—"))
+            with right:
+                st.markdown("**Final draft**")
+                for cat, vals in draft_entities.items():
+                    st.write(f"{cat}: " + (", ".join(vals) if vals else "—"))
+            st.caption("If a fact is missing here, the extraction step—not the comparison step—is the problem.")
+
         conflicts=[r for r in rows if r[0]=="CONFLICT"]
         reviews=[r for r in rows if r[0]=="REVIEW"]
         passes=[r for r in rows if r[0]=="PASS"]
